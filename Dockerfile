@@ -20,8 +20,12 @@ ARG NPM_REGISTRY
 RUN apk add --no-cache python3 make g++ linux-headers
 
 COPY package.json ./
+# --include=dev: the build needs devDependencies (tailwind/postcss, and wreq-js
+# for the runner COPY below). Platforms such as Coolify can pass NODE_ENV=production
+# into the build, which would otherwise make npm skip them and fail `next build`.
 RUN --mount=type=cache,target=/root/.npm \
     npm install \
+      --include=dev \
       --registry="${NPM_REGISTRY}" \
       --fetch-retries=5 \
       --fetch-retry-factor=2 \
