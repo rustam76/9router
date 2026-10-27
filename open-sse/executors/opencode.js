@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
-import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
@@ -24,6 +24,7 @@ const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
+const SESSION_SOURCE_FIELD = "_opencodeSessionSource";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -37,6 +38,43 @@ const RESPONSES_MODELS = new Set([
   "muse-spark-1.3-contributor-free",
 ]);
 const MESSAGES_MODELS = new Set(["union-alpha"]);
+
+// Upstream answers 429 for two different reasons. FreeUsageLimitError is the
+// free-tier quota (live 2026-10-27: Retry-After 55075s, ~15h) — no retry can
+// succeed, so it returns to the client at once with Retry-After intact. Any
+// other 429 is a short rate limit: wait out Retry-After when it is short,
+// else back off exponentially; a long Retry-After is returned, not waited on.
+const QUOTA_ERROR_TYPE = "FreeUsageLimitError";
+const RATE_LIMIT_MAX_WAIT_MS = 10000;
+const RATE_LIMIT_BACKOFF_BASE_MS = 1000;
+
+function parseRetryAfterMs(value) {
+  if (value == null || value === "") return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds >= 0 ? seconds * 1000 : null;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+}
+
+async function classifyRateLimit(response) {
+  let type = "";
+  try {
+    const json = JSON.parse(await response.clone().text());
+    type = typeof json?.error?.type === "string" ? json.error.type : "";
+  } catch {
+    // Non-JSON 429 (e.g. an edge rate limit) is treated as transient.
+  }
+  return {
+    quota: type === QUOTA_ERROR_TYPE,
+    type,
+    retryAfterMs: parseRetryAfterMs(response.headers?.get?.("retry-after")),
+  };
+}
+
+// Diagnostics name the session by a short digest, never the id itself.
+function sessionTag(session) {
+  return session ? crypto.createHash("sha256").update(String(session)).digest("hex").slice(0, 8) : "none";
+}
 
 let lastTimestamp = 0;
 let counter = 0;
@@ -88,11 +126,12 @@ const translatedSessionCleanup = setInterval(() => {
 }, MEMORY_CONFIG.sessionCleanupIntervalMs);
 if (translatedSessionCleanup.unref) translatedSessionCleanup.unref();
 
-export function translateSessionId(sessionId, clientTool = "") {
+// `scope` keeps two callers that send the same raw id (e.g. "default") apart.
+export function translateSessionId(sessionId, clientTool = "", scope = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
-  const key = `${clientTool || "generic"}\0${sessionId || ""}`;
+  const key = `${scope}\0${clientTool || "generic"}\0${sessionId || ""}`;
   const existing = translatedOpencodeSessions.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
@@ -142,16 +181,27 @@ const stableSessionCleanup = setInterval(() => {
 }, MEMORY_CONFIG.sessionCleanupIntervalMs);
 if (stableSessionCleanup.unref) stableSessionCleanup.unref();
 
-function identityKey(credentials) {
+// Free providers share one virtual connection ("noauth", see sse/services/auth.js),
+// so its id cannot tell callers apart. Keying on it put every caller of an
+// instance on one upstream session: they inherited each other's 429s and mixed
+// conversation affinity. Scope by the caller's own credential instead — a
+// digest only, never the raw key.
+const SHARED_CONNECTION_ID = "noauth";
+
+function callerScope(credentials) {
   const connectionId = credentials?.connectionId || credentials?.id;
-  if (connectionId) return `opencode:conn:${String(connectionId).slice(0, 128)}`;
+  if (connectionId && connectionId !== SHARED_CONNECTION_ID) return `conn:${String(connectionId).slice(0, 128)}`;
   const raw = credentials?.rawHeaders || {};
   const auth = raw.authorization || raw.Authorization || raw["x-api-key"] || raw["X-Api-Key"] || "";
   if (auth) {
     const digest = crypto.createHash("sha256").update(String(auth)).digest("hex").slice(0, 32);
-    return `opencode:auth:${digest}`;
+    return `auth:${digest}`;
   }
-  return "opencode:default";
+  return "default";
+}
+
+function identityKey(credentials) {
+  return `opencode:${callerScope(credentials)}`;
 }
 
 export function stableSessionId(credentials) {
@@ -217,10 +267,12 @@ function isMessagesModel(model) {
   return MESSAGES_MODELS.has(baseModelId(model));
 }
 
+// Returns { session, source }; source names the tier that picked the session
+// and only feeds diagnostics.
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
-  if (native) return native;
+  if (native) return { session: native, source: "client" };
 
   let incoming = null;
   for (const [key, value] of Object.entries(headers)) {
@@ -230,8 +282,9 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     }
   }
 
+  const scope = callerScope(credentials);
   const hinted = incoming || normalizeSession(providerSessionId);
-  if (hinted) return translateSessionId(hinted, clientTool);
+  if (hinted) return { session: translateSessionId(hinted, clientTool, scope), source: "translated" };
 
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
@@ -239,16 +292,19 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
       viaManager = resolveSessionId({
         headers,
         body,
-        connectionId: credentials?.connectionId,
+        // Caller-scoped so the assistant-text hash cannot collide across
+        // callers, and so a hint-only request maps to a stable id instead of
+        // a fresh random one per request.
+        connectionId: `opencode:${scope}`,
         scope: "opencode",
       });
     } catch {
       viaManager = null;
     }
-    if (viaManager) return translateSessionId(viaManager, clientTool);
+    if (viaManager) return { session: translateSessionId(viaManager, clientTool, scope), source: "conversation" };
   }
 
-  return stableSessionId(credentials);
+  return { session: stableSessionId(credentials), source: "stable" };
 }
 
 function normalizeResponsesTools(body) {
@@ -354,11 +410,12 @@ export class OpenCodeExecutor extends BaseExecutor {
 
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
     const sourceCredentials = credentials || {};
-    const session = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool);
+    const { session, source } = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool);
 
     return {
       ...sourceCredentials,
       [SESSION_FIELD]: session,
+      [SESSION_SOURCE_FIELD]: source,
     };
   }
 
@@ -410,15 +467,59 @@ export class OpenCodeExecutor extends BaseExecutor {
   // with a 429 FreeUsageLimitError that reads as exhausted quota.
   async execute(args) {
     const credentials = this.prepareRequestCredentials(args);
-    return super.execute({
+    // proxyAwareFetch only calls directFetch when no proxy applies; a proxied
+    // request rides undici, i.e. Node's own TLS ClientHello.
+    let transport = "proxy";
+    const result = await super.execute({
       ...args,
       credentials,
-      directFetch: (url, options) => opencodeTlsFetch(url, {
-        method: options.method,
-        headers: options.headers,
-        body: options.body,
-      }, { signal: options.signal }),
+      directFetch: (url, options) => {
+        transport = "tls-client";
+        return opencodeTlsFetch(url, {
+          method: options.method,
+          headers: options.headers,
+          body: options.body,
+        }, { signal: options.signal });
+      },
     });
+    if (result?.response?.status === HTTP_STATUS.RATE_LIMITED) {
+      await this.logRateLimit(result.response, credentials, transport, args.log);
+    }
+    return result;
+  }
+
+  // Hook for BaseExecutor.tryRetry. Only 429 is decided here; null keeps the
+  // configured delay for other statuses, false returns the response as-is.
+  async computeRetryDelay(response, attempt) {
+    if (response.status !== HTTP_STATUS.RATE_LIMITED) return null;
+    const { quota, retryAfterMs } = await classifyRateLimit(response);
+    if (quota) return false;
+    if (retryAfterMs != null) return retryAfterMs <= RATE_LIMIT_MAX_WAIT_MS ? retryAfterMs : false;
+    const backoff = RATE_LIMIT_BACKOFF_BASE_MS * 2 ** (attempt - 1);
+    const jitter = Math.floor(Math.random() * (RATE_LIMIT_BACKOFF_BASE_MS / 2));
+    return Math.min(backoff + jitter, RATE_LIMIT_MAX_WAIT_MS);
+  }
+
+  // One line per final 429 with what tells the causes apart: quota vs rate
+  // limit, the session tier, the transport and the runtime. No headers, keys
+  // or session ids are logged.
+  async logRateLimit(response, credentials, transport, log) {
+    if (!log?.warn) return;
+    const { quota, type, retryAfterMs } = await classifyRateLimit(response);
+    const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`;
+    const logId = String(response.headers?.get?.("x-opencode-log-id") || "").replace(/[^A-Za-z0-9-]/g, "").slice(0, 64);
+    const parts = [
+      `429 ${quota ? "free-tier quota exhausted" : "rate limited"}${type ? ` (${type})` : ""}`,
+      `retry-after=${retryAfterMs != null ? `${Math.round(retryAfterMs / 1000)}s` : "none"}`,
+      `session=${sessionTag(credentials?.[SESSION_FIELD])} (${credentials?.[SESSION_SOURCE_FIELD] || "unknown"})`,
+      `transport=${transport}`,
+      `runtime=${runtime}`,
+    ];
+    if (logId) parts.push(`upstream-log-id=${logId}`);
+    log.warn("OPENCODE", parts.join(" · "));
+    if (quota && transport === "proxy") {
+      log.warn("OPENCODE", "this request went through a proxy, which uses Node's TLS handshake; the free tier answers that handshake with FreeUsageLimitError whatever quota remains, so this 429 may not mean the quota is spent");
+    }
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

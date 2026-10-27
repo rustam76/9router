@@ -19,6 +19,11 @@ export default {
     },
     forceStream: true,
     noAuth: true,
+    // Up to two retries for a transient 429; OpenCodeExecutor.computeRetryDelay
+    // vetoes FreeUsageLimitError (quota) and any long Retry-After.
+    retry: {
+      "429": { attempts: 2 },
+    },
     // Zen reasoning models reject multi-turn history whose assistant messages
     // carry no reasoning_content (400 missing_required_parameter), and the
     // response pipeline strips the field before it reaches the client, so the
