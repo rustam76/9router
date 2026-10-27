@@ -8,8 +8,9 @@
 // JA4's cipher hash identifies the list (Bun: 5b57614c22b0), so the match is on
 // the cipher-list hash and nothing else — reordering the same list still passes.
 //
-// wreq-js is an optional dependency; when absent the caller keeps its native
-// fetch and stays subject to the gate rather than failing the request here.
+// wreq-js is loaded through lazyRuntime. When it cannot be loaded the request
+// fails here instead of falling back to native fetch, whose 429 would be
+// indistinguishable from a real free-tier quota error.
 
 import { loadRuntimeDep } from "./lazyRuntime.js";
 
@@ -43,6 +44,8 @@ export class OpencodeTlsUnavailableError extends Error {
   constructor(message) {
     super(message);
     this.name = "OpencodeTlsUnavailableError";
+    // A missing dependency stays missing; BaseExecutor must not retry it as a network error.
+    this.retryable = false;
   }
 }
 
@@ -84,7 +87,7 @@ export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEF
     session = await loadSession();
   } catch (error) {
     throw new OpencodeTlsUnavailableError(
-      `wreq-js unavailable (${error instanceof Error ? error.message : "unknown"}) — install the optional wreq-js dependency to reach the OpenCode free tier`
+      `wreq-js unavailable (${error instanceof Error ? error.message : "unknown"}) — 9router could not load its TLS client for the OpenCode free tier; this is a local install problem, not an upstream quota limit`
     );
   }
 

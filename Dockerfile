@@ -67,6 +67,12 @@ COPY --from=builder /app/node_modules/next ./node_modules/next
 COPY --from=builder /app/node_modules/sql.js ./node_modules/sql.js
 # node-machine-id is createRequire-loaded at runtime; tracing omits it.
 COPY --from=builder /app/node_modules/node-machine-id ./node_modules/node-machine-id
+# wreq-js is loaded via lazyRuntime's webpackIgnore import, so tracing omits it. The
+# OpenCode free tier needs it on every request; shipping it avoids an on-demand npm
+# install at request time. @wreq-js holds the native binding npm picked for this
+# image's libc/arch (linux-*-musl), and the builder shares the runner's base image.
+COPY --from=builder /app/node_modules/wreq-js ./node_modules/wreq-js
+COPY --from=builder /app/node_modules/@wreq-js ./node_modules/@wreq-js
 
 RUN mkdir -p /app/data && chown -R node:node /app && \
   mkdir -p /app/data-home && chown node:node /app/data-home && \
