@@ -1,6 +1,11 @@
 services:
   9router:
-    image: decolua/9router:latest
+    # Build from this repository's Dockerfile. A prebuilt `image:` (e.g.
+    # decolua/9router:latest) would ignore every change in this repo, and
+    # Coolify's Docker Compose build pack would redeploy that image unchanged.
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: 9router
     restart: always
     ports:
