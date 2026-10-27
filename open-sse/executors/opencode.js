@@ -4,7 +4,7 @@ import { PROVIDERS } from "../config/providers.js";
 import { HTTP_STATUS, MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
-import { resolveSessionId } from "../utils/sessionManager.js";
+import { hasClientSessionId, resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
@@ -283,10 +283,17 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   }
 
   const scope = callerScope(credentials);
-  const hinted = incoming || normalizeSession(providerSessionId);
+  // chatCore seeds providerSessionId from resolveSessionId with the request's
+  // connection id. The shared noauth connection has none, so with no client
+  // session signal the seed is a fresh random id per request, and translating
+  // it minted a new upstream session for every request and every combo model.
+  // There the client's real signals are read below instead, caller-scoped.
+  const sharedConnection = !credentials?.connectionId || credentials.connectionId === SHARED_CONNECTION_ID;
+  const seed = sharedConnection ? null : normalizeSession(providerSessionId);
+  const hinted = incoming || seed;
   if (hinted) return { session: translateSessionId(hinted, clientTool, scope), source: "translated" };
 
-  if (credentials?.connectionId || bodyHasSessionHints(body)) {
+  if (credentials?.connectionId || bodyHasSessionHints(body) || hasClientSessionId(headers, body, "opencode")) {
     let viaManager = null;
     try {
       viaManager = resolveSessionId({

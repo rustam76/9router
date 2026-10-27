@@ -157,6 +157,12 @@ function extractClientSessionId(headers, body, scope = "") {
     return fromBody || null;
 }
 
+// True when the client itself sent a session id (header or body), as opposed
+// to one this module would derive or mint.
+export function hasClientSessionId(headers, body, scope = "") {
+    return !!extractClientSessionId(headers, body, scope);
+}
+
 function requestMessages(body) {
     if (Array.isArray(body?.messages)) return body.messages;
     if (Array.isArray(body?.input)) return body.input;

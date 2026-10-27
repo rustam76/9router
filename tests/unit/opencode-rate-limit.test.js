@@ -16,6 +16,7 @@ vi.mock("../../open-sse/services/opencodeTlsClient.js", async (importOriginal) =
 
 const { getExecutor } = await import("../../open-sse/executors/index.js");
 const { translateSessionId, OPENCODE_SESSION_RE } = await import("../../open-sse/executors/opencode.js");
+const { generateBinaryStyleId } = await import("../../open-sse/utils/sessionManager.js");
 
 // Shape returned by getProviderCredentials for noAuth providers (src/sse/services/auth.js).
 function sharedCredentials(rawHeaders = {}) {
@@ -72,6 +73,39 @@ describe("OpenCode Free session scoping on the shared noauth connection", () => 
   it("separates the same raw client session id coming from different callers", () => {
     expect(translateSessionId("default", "claude", "auth:a")).not.toBe(translateSessionId("default", "claude", "auth:b"));
     expect(translateSessionId("default", "claude", "auth:a")).toBe(translateSessionId("default", "claude", "auth:a"));
+  });
+
+  // chatCore's seed for the shared connection is random per request when the
+  // client sends no session signal; it used to mint one upstream session per
+  // request and per combo model (seen live: 7 sessions for one conversation).
+  it("ignores chatCore's per-request random seed and keeps one session per caller", () => {
+    const executor = getExecutor("opencode");
+    const body = { messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }] };
+    const prepare = () => executor.prepareRequestCredentials({
+      body,
+      credentials: sharedCredentials({ authorization: "Bearer key-F" }),
+      providerSessionId: generateBinaryStyleId(),
+    });
+    const first = prepare();
+    const second = prepare();
+    expect(second._opencodeSession).toBe(first._opencodeSession);
+    expect(first._opencodeSessionSource).toBe("stable");
+  });
+
+  it("still separates conversations the client identifies itself", () => {
+    const executor = getExecutor("opencode");
+    const body = { messages: [{ role: "user", content: "hi" }] };
+    const forConversation = (id) => executor.prepareRequestCredentials({
+      body,
+      credentials: sharedCredentials({ authorization: "Bearer key-G", "x-session-id": id }),
+      providerSessionId: generateBinaryStyleId(),
+    });
+    const a1 = forConversation("conv-1");
+    const a2 = forConversation("conv-1");
+    const b = forConversation("conv-2");
+    expect(a2._opencodeSession).toBe(a1._opencodeSession);
+    expect(b._opencodeSession).not.toBe(a1._opencodeSession);
+    expect(a1._opencodeSessionSource).toBe("conversation");
   });
 
   it("passes a native OpenCode session from the client through untouched", () => {
